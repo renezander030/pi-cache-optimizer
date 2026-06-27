@@ -118,7 +118,7 @@ Instead of guessing from turn count, the extension reads `ctx.getContextUsage()`
 - At **65%** of the context window → a one-time gentle nudge.
 - At **78%** → automatic `ctx.compact()` with cache-preserving instructions (keep current task, recent edits, active decisions; drop stale tool output).
 
-Thresholds and the on/off switch live at the top of `src/index.ts` (`AUTO_COMPACT_PERCENT`, `WARN_COMPACT_PERCENT`, `AUTO_COMPACT_ENABLED`). When token usage is unavailable (e.g. right after compaction) it falls back to the legacy turn/time heuristic.
+Thresholds and the on/off switch live at the top of `src/index.ts` (`AUTO_COMPACT_PERCENT`, `WARN_COMPACT_PERCENT`, `AUTO_COMPACT_MIN_TOKENS`, `AUTO_COMPACT_ENABLED`). Pi reports `ContextUsage.percent` on a 0-100 scale, so these constants use the same scale. When token usage is unavailable (e.g. right after compaction) it falls back to the legacy turn/time heuristic.
 
 ### 3. Cache-bust guard (`tool_call`)
 

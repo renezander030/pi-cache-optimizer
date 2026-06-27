@@ -40,6 +40,12 @@ interface CacheTelemetry {
   assistantMessages: number;
 }
 
+interface ContextUsageSnapshot {
+  percent?: number | null;
+  tokens?: number | null;
+  contextWindow?: number | null;
+}
+
 const IGNORE_TEMPLATE = `# pi-cache-optimizer auto-generated strict ignore file
 # Protects context payload from build artifacts and noise
 
@@ -121,8 +127,9 @@ const COMPACT_TURN_THRESHOLD = 18;           // turns (fallback when token usage
 const COMPACT_TIME_MS = 45 * 60 * 1000;      // 45 minutes continuous
 
 // Auto-compact context-pressure thresholds (feature #2)
-const AUTO_COMPACT_PERCENT = 0.78;           // trigger auto-compaction at 78% of context window
-const WARN_COMPACT_PERCENT = 0.65;           // gentle nudge at 65%
+const AUTO_COMPACT_PERCENT = 78;             // trigger auto-compaction at 78% of context window
+const WARN_COMPACT_PERCENT = 65;             // gentle nudge at 65%
+const AUTO_COMPACT_MIN_TOKENS = 8_000;       // below this, Pi reports "nothing to compact"
 const AUTO_COMPACT_ENABLED = true;           // when false, only warns instead of compacting
 
 // Cache-bust guard thresholds (feature #3)
@@ -309,6 +316,16 @@ function fmtTokens(n: number): string {
   return `${n}`;
 }
 
+function contextPercent(usage: ContextUsageSnapshot | null | undefined): number | null {
+  const pct = usage?.percent;
+  return typeof pct === "number" && Number.isFinite(pct) ? pct : null;
+}
+
+function contextTokens(usage: ContextUsageSnapshot | null | undefined): number | null {
+  const tokens = usage?.tokens;
+  return typeof tokens === "number" && Number.isFinite(tokens) ? tokens : null;
+}
+
 function renderTelemetryWidget(ctx: ExtensionContext, t: CacheTelemetry): void {
   if (!ctx.hasUI) return;
   const hr = hitRate(t);
@@ -410,14 +427,35 @@ export default function (pi: ExtensionAPI) {
 
     // Real context-pressure signal (preferred over turn/time heuristic)
     const usage = ctx.getContextUsage();
-    const pct = usage?.percent ?? null;
+    const pct = contextPercent(usage);
+    const tokens = contextTokens(usage);
 
     if (pct !== null) {
-      if (AUTO_COMPACT_ENABLED && pct >= AUTO_COMPACT_PERCENT && !compacting) {
+      const tooSmallToCompact = tokens !== null && tokens < AUTO_COMPACT_MIN_TOKENS;
+
+      if (
+        AUTO_COMPACT_ENABLED &&
+        pct >= AUTO_COMPACT_PERCENT &&
+        tooSmallToCompact &&
+        !warnedThisSession &&
+        !compacting
+      ) {
+        warnedThisSession = true;
+        ctx.ui.notify(
+          chalk.cyan(
+            `💡 Context at ${pct.toFixed(0)}% (${fmtTokens(tokens!)} tok), ` +
+            `below the ${fmtTokens(AUTO_COMPACT_MIN_TOKENS)}-token auto-compaction floor.`
+          ),
+          "info"
+        );
+        return;
+      }
+
+      if (AUTO_COMPACT_ENABLED && pct >= AUTO_COMPACT_PERCENT && !tooSmallToCompact && !compacting) {
         compacting = true;
         ctx.ui.notify(
           chalk.cyan(
-            `🗜  Context at ${(pct * 100).toFixed(0)}% — auto-compacting to preserve cache & headroom…`
+            `🗜  Context at ${pct.toFixed(0)}% — auto-compacting to preserve cache & headroom…`
           ),
           "info"
         );
@@ -441,8 +479,8 @@ export default function (pi: ExtensionAPI) {
         warnedThisSession = true;
         ctx.ui.notify(
           chalk.cyan(
-            `💡 Context at ${(pct * 100).toFixed(0)}% (${fmtTokens(usage!.tokens ?? 0)} tok). ` +
-            `Auto-compaction will trigger at ${(AUTO_COMPACT_PERCENT * 100).toFixed(0)}%.`
+            `💡 Context at ${pct.toFixed(0)}% (${fmtTokens(tokens ?? 0)} tok). ` +
+            `Auto-compaction will trigger at ${AUTO_COMPACT_PERCENT.toFixed(0)}%.`
           ),
           "info"
         );
@@ -511,6 +549,7 @@ export default function (pi: ExtensionAPI) {
       const cwd = ctx.cwd;
       const hr = hitRate(telemetry);
       const usage = ctx.getContextUsage();
+      const pct = contextPercent(usage);
 
       ctx.ui.notify(
         [
@@ -524,10 +563,10 @@ export default function (pi: ExtensionAPI) {
           `  Est. cost:    $${telemetry.cost.toFixed(4)} over ${telemetry.assistantMessages} msgs`,
           "",
           chalk.bold("Context window:"),
-          usage && usage.percent !== null
-            ? `  Usage:        ${(usage.percent * 100).toFixed(0)}% (${fmtTokens(usage.tokens ?? 0)}/${fmtTokens(usage.contextWindow)})`
+          pct !== null
+            ? `  Usage:        ${pct.toFixed(0)}% (${fmtTokens(contextTokens(usage) ?? 0)}/${fmtTokens(usage.contextWindow ?? 0)})`
             : "  Usage:        (unknown)",
-          `  Auto-compact: ${AUTO_COMPACT_ENABLED ? `at ${(AUTO_COMPACT_PERCENT * 100).toFixed(0)}%` : "disabled"}`,
+          `  Auto-compact: ${AUTO_COMPACT_ENABLED ? `at ${AUTO_COMPACT_PERCENT.toFixed(0)}% (${fmtTokens(AUTO_COMPACT_MIN_TOKENS)} token floor)` : "disabled"}`,
           "",
           chalk.bold("Session:"),
           `  Last repo:    ${s.lastCwd || "(none)"}`,
