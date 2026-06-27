@@ -2,10 +2,17 @@
  * pi-cache-optimizer
  * Global extension for context caching optimization, ignore-file management,
  * repo-hop detection, compact watchdog, and warm KV-cache provider routing.
+ *
+ * Features:
+ *   1. Live cache telemetry  (message_end → real usage: hit-rate, tokens, cost)
+ *   2. Auto-compact watchdog  (turn_end → ctx.getContextUsage + ctx.compact)
+ *   3. Cache-bust guard        (tool_call → block/warn reads of ignored/huge files)
+ *   + .claudecodeignore auto-injection, repo-hop detection, /cache-status command
  */
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { isToolCallEventType } from "@earendil-works/pi-coding-agent";
+import { existsSync, readFileSync, writeFileSync, mkdirSync, statSync } from "node:fs";
+import { join, resolve, basename } from "node:path";
 import { homedir } from "node:os";
 import chalk from "chalk";
 
@@ -21,6 +28,16 @@ interface CacheOptimizerState {
   lastTimestamp: number; // epoch ms
   turnCount: number;
   sessionStartTime: number;
+}
+
+/** In-memory, per-process cache/cost telemetry (not persisted). */
+interface CacheTelemetry {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+  cost: number;
+  assistantMessages: number;
 }
 
 const IGNORE_TEMPLATE = `# pi-cache-optimizer auto-generated strict ignore file
@@ -100,8 +117,18 @@ Thumbs.db
 `;
 
 // Thresholds for compact watchdog
-const COMPACT_TURN_THRESHOLD = 18;           // turns
+const COMPACT_TURN_THRESHOLD = 18;           // turns (fallback when token usage unknown)
 const COMPACT_TIME_MS = 45 * 60 * 1000;      // 45 minutes continuous
+
+// Auto-compact context-pressure thresholds (feature #2)
+const AUTO_COMPACT_PERCENT = 0.78;           // trigger auto-compaction at 78% of context window
+const WARN_COMPACT_PERCENT = 0.65;           // gentle nudge at 65%
+const AUTO_COMPACT_ENABLED = true;           // when false, only warns instead of compacting
+
+// Cache-bust guard thresholds (feature #3)
+const GUARD_ENABLED = true;
+const GUARD_BLOCK_IGNORED = true;            // hard-block reads that match .claudecodeignore
+const GUARD_MAX_FILE_BYTES = 256 * 1024;     // warn/block reads of files larger than 256 KB
 
 // Repo-hop warning window
 const REPO_HOP_WINDOW_MS = 3 * 60 * 60 * 1000; // 3 hours
@@ -167,6 +194,75 @@ function ensureIgnoreFile(cwd: string, ctx: ExtensionContext): void {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Ignore-pattern matching (shared by the cache-bust guard)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Load and cache parsed ignore patterns per cwd. */
+const ignoreCache = new Map<string, string[]>();
+
+function loadIgnorePatterns(cwd: string): string[] {
+  if (ignoreCache.has(cwd)) return ignoreCache.get(cwd)!;
+
+  const patterns: string[] = [];
+  for (const name of [".claudecodeignore", ".cursorignore"]) {
+    const file = join(cwd, name);
+    if (existsSync(file)) {
+      try {
+        for (const line of readFileSync(file, "utf8").split("\n")) {
+          const trimmed = line.trim();
+          if (trimmed && !trimmed.startsWith("#")) patterns.push(trimmed);
+        }
+      } catch {
+        // ignore unreadable ignore file
+      }
+    }
+  }
+  // Fall back to template patterns so the guard works even before a file lands on disk.
+  if (patterns.length === 0) {
+    for (const line of IGNORE_TEMPLATE.split("\n")) {
+      const trimmed = line.trim();
+      if (trimmed && !trimmed.startsWith("#")) patterns.push(trimmed);
+    }
+  }
+  ignoreCache.set(cwd, patterns);
+  return patterns;
+}
+
+/** Convert a single gitignore-ish glob to a RegExp tested against a relative posix path. */
+function patternToRegExp(pattern: string): RegExp {
+  let p = pattern;
+  const dirOnly = p.endsWith("/");
+  if (dirOnly) p = p.slice(0, -1);
+  const anchored = p.startsWith("/");
+  if (anchored) p = p.slice(1);
+
+  // Escape regex specials except glob wildcards * and ?
+  const escaped = p
+    .replace(/[.+^${}()|[\]\\]/g, "\\$&")
+    .replace(/\*/g, "[^/]*")
+    .replace(/\?/g, "[^/]");
+
+  // Anchored patterns match from root; otherwise match any path segment boundary.
+  const head = anchored ? "^" : "(^|/)";
+  // Directory patterns match the dir and everything under it.
+  const tail = dirOnly ? "(/|$)" : "($|/)";
+  return new RegExp(head + escaped + tail);
+}
+
+/** Returns the matching pattern if `relPath` (posix, repo-relative) is ignored, else null. */
+function matchedIgnorePattern(relPath: string, patterns: string[]): string | null {
+  const norm = relPath.replace(/\\/g, "/").replace(/^\.\//, "");
+  for (const pattern of patterns) {
+    try {
+      if (patternToRegExp(pattern).test(norm)) return pattern;
+    } catch {
+      // skip malformed pattern
+    }
+  }
+  return null;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Repo-hop detection & LRU cache warning
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -193,7 +289,47 @@ function checkRepoHop(currentCwd: string, ctx: ExtensionContext, state: CacheOpt
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Compact watchdog (turn + time based)
+// Cache telemetry helpers (feature #1)
+// ─────────────────────────────────────────────────────────────────────────────
+
+function freshTelemetry(): CacheTelemetry {
+  return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, assistantMessages: 0 };
+}
+
+/** Cache hit rate = cacheRead / (cacheRead + uncached input). 0..1, or null if no data. */
+function hitRate(t: CacheTelemetry): number | null {
+  const denom = t.cacheRead + t.input;
+  if (denom <= 0) return null;
+  return t.cacheRead / denom;
+}
+
+function fmtTokens(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
+  return `${n}`;
+}
+
+function renderTelemetryWidget(ctx: ExtensionContext, t: CacheTelemetry): void {
+  if (!ctx.hasUI) return;
+  const hr = hitRate(t);
+  const hrStr = hr === null ? "—" : `${(hr * 100).toFixed(0)}%`;
+  const hrColored =
+    hr === null ? chalk.gray(hrStr)
+    : hr >= 0.7 ? chalk.green(hrStr)
+    : hr >= 0.4 ? chalk.yellow(hrStr)
+    : chalk.red(hrStr);
+
+  ctx.ui.setWidget("cache-optimizer", [
+    `${chalk.bold("cache")} hit ${hrColored}  ` +
+    `${chalk.gray("read")} ${fmtTokens(t.cacheRead)} ` +
+    `${chalk.gray("in")} ${fmtTokens(t.input)} ` +
+    `${chalk.gray("out")} ${fmtTokens(t.output)}  ` +
+    `${chalk.gray("$")}${t.cost.toFixed(4)}`,
+  ]);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Compact watchdog (turn + time based fallback)
 // ─────────────────────────────────────────────────────────────────────────────
 
 function maybeNudgeCompact(ctx: ExtensionContext, state: CacheOptimizerState): void {
@@ -227,39 +363,178 @@ export default function (pi: ExtensionAPI) {
   state.sessionStartTime = Date.now(); // reset per process start
   saveState(state);
 
+  // Per-process telemetry + control flags
+  let telemetry = freshTelemetry();
+  let warnedThisSession = false;   // context-pressure warning already shown
+  let compacting = false;          // guard against re-entrant auto-compaction
+
   // ── 1. Session Start Hook ────────────────────────────────────────────────
   pi.on("session_start", async (_event, ctx) => {
     // Always ensure strict ignore file exists (global behavior)
     ensureIgnoreFile(ctx.cwd, ctx);
 
+    // Invalidate the ignore-pattern cache for this cwd (file may have changed)
+    ignoreCache.delete(ctx.cwd);
+
     // Repo-hop detection
     checkRepoHop(ctx.cwd, ctx, state);
 
-    // Reset turn counter on fresh session
+    // Reset per-session counters + telemetry
     state.turnCount = 0;
     saveState(state);
+    telemetry = freshTelemetry();
+    warnedThisSession = false;
+    renderTelemetryWidget(ctx, telemetry);
   });
 
-  // ── 2. Turn Counter (for compact watchdog) ───────────────────────────────
+  // ── Feature #1: Live cache telemetry ─────────────────────────────────────
+  pi.on("message_end", async (event, ctx) => {
+    if (event.message.role !== "assistant") return;
+    const u = event.message.usage;
+    if (!u) return;
+
+    telemetry.input += u.input ?? 0;
+    telemetry.output += u.output ?? 0;
+    telemetry.cacheRead += u.cacheRead ?? 0;
+    telemetry.cacheWrite += u.cacheWrite ?? 0;
+    telemetry.cost += u.cost?.total ?? 0;
+    telemetry.assistantMessages += 1;
+
+    renderTelemetryWidget(ctx, telemetry);
+  });
+
+  // ── 2. Turn Counter + context-pressure auto-compaction ───────────────────
   pi.on("turn_end", async (_event, ctx) => {
     state.turnCount += 1;
     saveState(state);
+
+    // Real context-pressure signal (preferred over turn/time heuristic)
+    const usage = ctx.getContextUsage();
+    const pct = usage?.percent ?? null;
+
+    if (pct !== null) {
+      if (AUTO_COMPACT_ENABLED && pct >= AUTO_COMPACT_PERCENT && !compacting) {
+        compacting = true;
+        ctx.ui.notify(
+          chalk.cyan(
+            `🗜  Context at ${(pct * 100).toFixed(0)}% — auto-compacting to preserve cache & headroom…`
+          ),
+          "info"
+        );
+        ctx.compact({
+          customInstructions:
+            "Preserve the current task, recent file edits, and active decisions. Drop stale tool output.",
+          onComplete: () => {
+            compacting = false;
+            warnedThisSession = false;
+            ctx.ui.notify(chalk.green("✓ Auto-compaction complete."), "info");
+          },
+          onError: (err) => {
+            compacting = false;
+            ctx.ui.notify(chalk.yellow(`Auto-compaction failed: ${err.message}`), "warn");
+          },
+        });
+        return;
+      }
+
+      if (pct >= WARN_COMPACT_PERCENT && !warnedThisSession && !compacting) {
+        warnedThisSession = true;
+        ctx.ui.notify(
+          chalk.cyan(
+            `💡 Context at ${(pct * 100).toFixed(0)}% (${fmtTokens(usage!.tokens ?? 0)} tok). ` +
+            `Auto-compaction will trigger at ${(AUTO_COMPACT_PERCENT * 100).toFixed(0)}%.`
+          ),
+          "info"
+        );
+      }
+      return; // token signal available → skip the legacy heuristic
+    }
+
+    // Fallback: turn/time heuristic when token usage is unknown
     maybeNudgeCompact(ctx, state);
   });
 
-  // ── 3. (Optional) expose a quick status command ──────────────────────────
+  // ── Feature #3: Cache-bust guard on tool reads ───────────────────────────
+  pi.on("tool_call", async (event, ctx) => {
+    if (!GUARD_ENABLED) return;
+
+    // Resolve the candidate path for read / bash-cat style calls
+    let target: string | null = null;
+    if (isToolCallEventType("read", event)) {
+      target = event.input.path;
+    } else if (isToolCallEventType("bash", event)) {
+      // Best-effort: catch `cat <file>` on a single ignored/huge file
+      const m = event.input.command?.match(/^\s*cat\s+(?:-\S+\s+)*("?)([^"|;&]+)\1\s*$/);
+      if (m) target = m[2].trim();
+    }
+    if (!target) return;
+
+    const abs = resolve(ctx.cwd, target);
+    const rel = abs.startsWith(ctx.cwd) ? abs.slice(ctx.cwd.length + 1) : target;
+
+    // a) ignored-file match
+    const patterns = loadIgnorePatterns(ctx.cwd);
+    const hit = matchedIgnorePattern(rel, patterns) ?? matchedIgnorePattern(basename(abs), patterns);
+    if (hit) {
+      const msg = `cache-optimizer: "${rel}" matches ignore rule "${hit}" — reading it bloats context and busts the cached prefix.`;
+      if (GUARD_BLOCK_IGNORED) {
+        return { block: true, reason: msg + " Blocked. Remove the rule or read a specific slice if truly needed." };
+      }
+      ctx.ui.notify(chalk.yellow("⚠ " + msg), "warn");
+      return;
+    }
+
+    // b) oversized-file guard
+    try {
+      if (existsSync(abs)) {
+        const size = statSync(abs).size;
+        if (size > GUARD_MAX_FILE_BYTES) {
+          const kb = Math.round(size / 1024);
+          return {
+            block: true,
+            reason:
+              `cache-optimizer: "${rel}" is ${kb} KB (> ${Math.round(GUARD_MAX_FILE_BYTES / 1024)} KB). ` +
+              `Reading it whole wrecks cache efficiency. Use read offset/limit or grep instead.`,
+          };
+        }
+      }
+    } catch {
+      // stat failure is non-fatal; let the read proceed
+    }
+  });
+
+  // ── 3. /cache-status command ──────────────────────────────────────────────
   pi.registerCommand("cache-status", {
-    description: "Show pi-cache-optimizer state and recommendations",
+    description: "Show pi-cache-optimizer state, live cache telemetry, and recommendations",
     handler: async (_args, ctx) => {
       const s = loadState();
       const cwd = ctx.cwd;
+      const hr = hitRate(telemetry);
+      const usage = ctx.getContextUsage();
+
       ctx.ui.notify(
         [
           chalk.bold("pi-cache-optimizer status"),
-          `Last repo: ${s.lastCwd || "(none)"}`,
-          `Turns this session: ${s.turnCount}`,
-          `Session age: ${Math.round((Date.now() - s.sessionStartTime) / 60000)}m`,
-          `.claudecodeignore present: ${existsSync(join(cwd, ".claudecodeignore"))}`,
+          "",
+          chalk.bold("Cache telemetry (this session):"),
+          `  Hit rate:     ${hr === null ? "—" : (hr * 100).toFixed(1) + "%"}`,
+          `  Cache read:   ${fmtTokens(telemetry.cacheRead)} tok`,
+          `  Cache write:  ${fmtTokens(telemetry.cacheWrite)} tok`,
+          `  Input/Output: ${fmtTokens(telemetry.input)} / ${fmtTokens(telemetry.output)} tok`,
+          `  Est. cost:    $${telemetry.cost.toFixed(4)} over ${telemetry.assistantMessages} msgs`,
+          "",
+          chalk.bold("Context window:"),
+          usage && usage.percent !== null
+            ? `  Usage:        ${(usage.percent * 100).toFixed(0)}% (${fmtTokens(usage.tokens ?? 0)}/${fmtTokens(usage.contextWindow)})`
+            : "  Usage:        (unknown)",
+          `  Auto-compact: ${AUTO_COMPACT_ENABLED ? `at ${(AUTO_COMPACT_PERCENT * 100).toFixed(0)}%` : "disabled"}`,
+          "",
+          chalk.bold("Session:"),
+          `  Last repo:    ${s.lastCwd || "(none)"}`,
+          `  Turns:        ${s.turnCount}`,
+          `  Age:          ${Math.round((Date.now() - s.sessionStartTime) / 60000)}m`,
+          `  Guard:        ${GUARD_ENABLED ? `on (block ignored: ${GUARD_BLOCK_IGNORED}, max ${Math.round(GUARD_MAX_FILE_BYTES / 1024)}KB)` : "off"}`,
+          `  .claudecodeignore present: ${existsSync(join(cwd, ".claudecodeignore"))}`,
         ].join("\n"),
         "info"
       );
