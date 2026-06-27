@@ -63,8 +63,8 @@ Merge the following structure into your global model configuration. The file is 
       "baseUrl": "https://openrouter.ai/api/v1",
       "models": [
         {
-          "id": "anthropic/claude-sonnet-4",
-          "name": "Claude Sonnet 4 (OpenRouter, latest)",
+          "id": "anthropic/claude-sonnet-4.6",
+          "name": "Claude Sonnet 4.6 (OpenRouter, latest)",
           "reasoning": true,
           "input": ["text", "image"],
           "cost": { "input": 3, "output": 15, "cacheRead": 0.3, "cacheWrite": 3.75 },
@@ -76,11 +76,11 @@ Merge the following structure into your global model configuration. The file is 
           }
         },
         {
-          "id": "openai/gpt-4.1",
-          "name": "GPT-4.1 (OpenRouter, latest)",
+          "id": "openai/gpt-4o-2024-11-20",
+          "name": "GPT-4o (2024-11-20, OpenRouter latest)",
           "reasoning": false,
           "input": ["text", "image"],
-          "cost": { "input": 2, "output": 8, "cacheRead": 0.2, "cacheWrite": 2 },
+          "cost": { "input": 2.5, "output": 10, "cacheRead": 0.25, "cacheWrite": 2.5 },
           "contextWindow": 128000,
           "maxTokens": 32768,
           "cacheControl": {
