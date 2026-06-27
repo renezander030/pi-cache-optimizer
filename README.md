@@ -2,7 +2,7 @@
 
 Global Pi extension providing:
 
-- **Live cache telemetry** — real per-message cache hit-rate, token, and cost tracking shown in a widget above the editor
+- **Live cache telemetry** — real per-message cache read/write, token, and cost tracking (surfaced via `/cache-status`; the hit-rate itself is already shown by Pi's native footer as `CH`)
 - **Context-pressure auto-compaction** — triggers `/compact` automatically at a token threshold (not just a text nudge)
 - **Cache-bust guard** — blocks reads of ignored or oversized files that would bloat context and invalidate the cached prefix
 - Auto-injection of strict `.claudecodeignore` (and `.cursorignore` awareness)
@@ -103,13 +103,9 @@ Place the snippet in your `~/.pi/agent/models.json` (create the file if it does 
 
 ### 1. Live cache telemetry (`message_end`)
 
-Each assistant message reports real `usage` (input, output, `cacheRead`, `cacheWrite`, cost). The extension accumulates these per session and renders a live widget above the editor:
+Each assistant message reports real `usage` (input, output, `cacheRead`, `cacheWrite`, cost). The extension accumulates these per session and exposes them via `/cache-status`.
 
-```
-cache hit 82%  read 41.2k in 9.1k out 1.3k  $0.0421
-```
-
-Hit rate = `cacheRead / (cacheRead + uncached input)`. A sudden drop is your earliest signal that something busted the cached prefix (a repo hop, a volatile prompt, or a large file read). Full numbers are also available via `/cache-status`.
+Hit rate = `cacheRead / (uncached input + cacheRead + cacheWrite)` — i.e. the share of the full prompt served from cache. This uses the **same formula** as Pi's native footer `CH` (the footer reports the latest message; `/cache-status` reports the session-cumulative rate). The extension no longer renders its own widget line, since that only duplicated `CH` with a second, differently-computed (inflated) number that dropped the `cacheWrite` term from the denominator. A sudden drop in `CH` is your earliest signal that something busted the cached prefix (a repo hop, a volatile prompt, or a large file read).
 
 ### 2. Context-pressure auto-compaction (`turn_end`)
 
@@ -132,7 +128,7 @@ This closes the loop: the policy the ignore file describes is now enforced at re
 ## Lifecycle Hooks Used
 
 - `session_start` – injects `.claudecodeignore`, detects repo hops, resets telemetry
-- `message_end` – accumulates real cache/cost telemetry and updates the widget
+- `message_end` – accumulates real cache/cost telemetry for `/cache-status`
 - `turn_end` – reads real context usage; warns at 65%, auto-compacts at 78% (turn/time fallback otherwise)
 - `tool_call` – cache-bust guard blocking ignored / oversized file reads
 

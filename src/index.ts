@@ -303,9 +303,13 @@ function freshTelemetry(): CacheTelemetry {
   return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, assistantMessages: 0 };
 }
 
-/** Cache hit rate = cacheRead / (cacheRead + uncached input). 0..1, or null if no data. */
+/**
+ * Cache hit rate = cacheRead / (uncached input + cacheRead + cacheWrite). 0..1, or null if no data.
+ * Denominator is the full prompt token count (matches Pi's native footer `CH` calculation);
+ * omitting cacheWrite would understate the prompt size and inflate the rate.
+ */
 function hitRate(t: CacheTelemetry): number | null {
-  const denom = t.cacheRead + t.input;
+  const denom = t.input + t.cacheRead + t.cacheWrite;
   if (denom <= 0) return null;
   return t.cacheRead / denom;
 }
@@ -324,25 +328,6 @@ function contextPercent(usage: ContextUsageSnapshot | null | undefined): number 
 function contextTokens(usage: ContextUsageSnapshot | null | undefined): number | null {
   const tokens = usage?.tokens;
   return typeof tokens === "number" && Number.isFinite(tokens) ? tokens : null;
-}
-
-function renderTelemetryWidget(ctx: ExtensionContext, t: CacheTelemetry): void {
-  if (!ctx.hasUI) return;
-  const hr = hitRate(t);
-  const hrStr = hr === null ? "—" : `${(hr * 100).toFixed(0)}%`;
-  const hrColored =
-    hr === null ? chalk.gray(hrStr)
-    : hr >= 0.7 ? chalk.green(hrStr)
-    : hr >= 0.4 ? chalk.yellow(hrStr)
-    : chalk.red(hrStr);
-
-  ctx.ui.setWidget("cache-optimizer", [
-    `${chalk.bold("cache")} hit ${hrColored}  ` +
-    `${chalk.gray("read")} ${fmtTokens(t.cacheRead)} ` +
-    `${chalk.gray("in")} ${fmtTokens(t.input)} ` +
-    `${chalk.gray("out")} ${fmtTokens(t.output)}  ` +
-    `${chalk.gray("$")}${t.cost.toFixed(4)}`,
-  ]);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -401,11 +386,13 @@ export default function (pi: ExtensionAPI) {
     saveState(state);
     telemetry = freshTelemetry();
     warnedThisSession = false;
-    renderTelemetryWidget(ctx, telemetry);
   });
 
-  // ── Feature #1: Live cache telemetry ─────────────────────────────────────
-  pi.on("message_end", async (event, ctx) => {
+  // ── Feature #1: Live cache telemetry (accumulated for /cache-status) ──────
+  // Note: we intentionally do NOT render a widget hit-rate line — Pi's native
+  // footer already shows the latest cache hit rate as `CH`. Duplicating it here
+  // only invited a second, differently-computed (and inflated) number.
+  pi.on("message_end", async (event, _ctx) => {
     if (event.message.role !== "assistant") return;
     const u = event.message.usage;
     if (!u) return;
@@ -416,8 +403,6 @@ export default function (pi: ExtensionAPI) {
     telemetry.cacheWrite += u.cacheWrite ?? 0;
     telemetry.cost += u.cost?.total ?? 0;
     telemetry.assistantMessages += 1;
-
-    renderTelemetryWidget(ctx, telemetry);
   });
 
   // ── 2. Turn Counter + context-pressure auto-compaction ───────────────────
