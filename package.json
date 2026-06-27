@@ -1,0 +1,12 @@
+{
+  "name": "pi-cache-optimizer",
+  "version": "1.0.0",
+  "description": "Global Pi extension for context caching optimization, ignore file management, and LRU cache preservation",
+  "private": true,
+  "pi": {
+    "extensions": ["./src/index.ts"]
+  },
+  "dependencies": {
+    "chalk": "^5.3.0"
+  }
+}

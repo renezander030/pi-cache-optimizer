@@ -1,0 +1,16 @@
+# Dependencies (keep lockfile, exclude heavy node_modules)
+node_modules/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Temporary build artifacts
+*.tsbuildinfo
+dist/
+build/
+
+# Local Pi state (never commit)
+.cache_optimizer_state.json
